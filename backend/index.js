@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import express from 'express';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.js';
@@ -21,8 +22,17 @@ const databasePath = process.env.DATABASE_PATH === ':memory:'
         : undefined;
 const db = createDatabase(databasePath);
 const app = createApp(db);
-const port = Number(process.env.API_PORT || 3001);
+const frontendBuildPath = resolve(projectRoot, 'frontend', 'dist');
+app.use(express.static(frontendBuildPath, { index: false }));
+app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    return res.sendFile(resolve(frontendBuildPath, 'index.html'), error => {
+        if (error) next(error);
+    });
+});
+
+const port = Number(process.env.PORT || process.env.API_PORT || 3001);
 
 app.listen(port, () => {
-    console.log(`Repeato API listening on http://localhost:${port}`);
+    console.log(`Repeato listening on port ${port}`);
 });
