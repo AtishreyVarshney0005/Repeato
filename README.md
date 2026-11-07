@@ -31,7 +31,7 @@ npm start
 2. In Render, choose **New > Blueprint**, connect the repository, and apply the `render.yaml` configuration.
 3. Wait for the build and deploy to finish, then open the generated `onrender.com` URL.
 
-The Blueprint builds the React frontend and serves it with the API from one web service. It also creates a persistent disk for the SQLite database and generates `JWT_SECRET`. The persistent disk requires a paid Render instance. Do not remove the disk or change `DATABASE_PATH` unless you have backed up and migrated the database.
+The Blueprint builds the React frontend and serves it with the API from one free web service, and generates `JWT_SECRET`. It stores SQLite under `/tmp` because free Render instances do not include a persistent disk. **Data is temporary and can be lost when the service restarts or sleeps.** Use paid persistent storage or a managed database before relying on this deployment for real customer accounts, points, or orders.
 
 To enable Razorpay, add `RAZORPAY_KEY_ID` and `RAZORPAY_KEY_SECRET` as environment variables in the Render service, using Test Mode credentials first. Keep both values server-side and never put them in frontend variables.
 

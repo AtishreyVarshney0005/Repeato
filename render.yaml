@@ -2,18 +2,14 @@ services:
   - type: web
     name: repeato
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm ci && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
-    disk:
-      name: repeato-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: NODE_ENV
         value: production
       - key: DATABASE_PATH
-        value: /var/data/repeato.sqlite
+        value: /tmp/repeato.sqlite
       - key: JWT_SECRET
         generateValue: true
