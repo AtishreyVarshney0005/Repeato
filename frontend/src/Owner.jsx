@@ -167,8 +167,8 @@ export default function Owner({ onLogout, theme, setTheme }) {
         }
     };
     const addReward = async () => {
-        const name = prompt('Reward name?');
-        const pts = Number(prompt('Points required?'));
+        const name = prompt('Reward name? (for example: Free meal)');
+        const pts = Number(prompt('Points required to claim this reward?'));
         if (!name || !Number.isSafeInteger(pts) || pts <= 0) return;
         setError('');
         try {
@@ -505,7 +505,8 @@ export default function Owner({ onLogout, theme, setTheme }) {
           {!customers.length && <p className="small muted">Customers will appear here after they join.</p>}
         </div>}
         {nav === 'Rewards' && <div className="card">
-          <div className="row"><h3>Rewards</h3><button className="btn sm" onClick={addReward}>+ Add reward</button></div>
+          <div className="row"><div><h3>Rewards</h3><p className="small muted">Set what customers can claim with their points, such as a free meal.</p></div>
+            <button className="btn sm" onClick={addReward}>+ Add reward</button></div>
           {rewards.map(reward => <div className="row item" key={reward.id}>
             <div className="ico">{reward.icon}</div><div className="grow"><b>{reward.name}</b>
               <div className="small muted">{reward.pts} points · claimed {reward.claimed} times · {reward.on ? 'Active' : 'Inactive'}</div></div>

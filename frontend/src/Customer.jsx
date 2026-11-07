@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import Logo from './Logo';
-import { BUSINESS, REWARDS } from './data';
+import { BUSINESS } from './data';
 import { api } from './api';
 export default function Customer({ theme, setTheme, onBack }) {
     const [screen, setScreen] = useState('auth');
@@ -23,16 +23,11 @@ export default function Customer({ theme, setTheme, onBack }) {
     const [menuCategory, setMenuCategory] = useState('');
     const menuRequestRef = useRef(0);
     const [orderBusinessId, setOrderBusinessId] = useState(null);
-    const [fulfillment, setFulfillment] = useState('pickup');
-    const [deliveryAddress, setDeliveryAddress] = useState('');
-    const [deliveryLocation, setDeliveryLocation] = useState(null);
-    const [gettingLocation, setGettingLocation] = useState(false);
     const [points, setPoints] = useState(0);
     const [visits, setVisits] = useState(0);
     const [claimed, setClaimed] = useState(0);
     const [referrals, setReferrals] = useState(0);
     const [referralCode, setReferralCode] = useState('');
-    const [referredById, setReferredById] = useState(null);
     const [business, setBusiness] = useState({ id: null, menuUrl: '', pointsPerVisit: 10 });
     const [pendingCheckIn, setPendingCheckIn] = useState(null);
     const [scannerOpen, setScannerOpen] = useState(false);
@@ -43,7 +38,7 @@ export default function Customer({ theme, setTheme, onBack }) {
     const [birthday, setBirthday] = useState('');
     const [notificationsEnabled, setNotificationsEnabled] = useState(true);
     const [tx, setTx] = useState([]);
-    const [rewards, setRewards] = useState(REWARDS);
+    const [rewards, setRewards] = useState([]);
     const [menuItems, setMenuItems] = useState([]);
     const [accountMenuItems, setAccountMenuItems] = useState([]);
     const [orders, setOrders] = useState([]);
@@ -106,7 +101,6 @@ export default function Customer({ theme, setTheme, onBack }) {
         setClaimed(dashboard.claimed);
         setReferrals(dashboard.referrals ?? 0);
         setReferralCode(dashboard.user.referralCode || '');
-        setReferredById(dashboard.user.referredById);
         setPendingCheckIn(dashboard.pendingCheckIn);
         setRewards(dashboard.rewards);
         setMenuItems(dashboard.menuItems ?? []);
@@ -475,10 +469,9 @@ export default function Customer({ theme, setTheme, onBack }) {
             setCart([]);
         }
         if (orderBusinessId !== restaurant.id) {
-            setFulfillment('pickup');
             setPaymentMethod('cash_on_pickup');
         }
-        setOrderingBusiness({ ...restaurant, deliveryEnabled: Boolean(restaurant.deliveryEnabled) });
+        setOrderingBusiness(restaurant);
         setOrderBusinessId(restaurant.id);
         setMenuItems([]);
         setMenuSearch('');
@@ -510,7 +503,6 @@ export default function Customer({ theme, setTheme, onBack }) {
             setCart([]);
         }
         if (orderBusinessId !== business.id) {
-            setFulfillment('pickup');
             setPaymentMethod('cash_on_pickup');
         }
         setOrderingBusiness({ ...business, name: businessName });
@@ -522,27 +514,6 @@ export default function Customer({ theme, setTheme, onBack }) {
         menuRequestRef.current += 1;
         setLoadingRestaurantMenu(false);
         setScreen('menu');
-    };
-    const captureDeliveryLocation = () => {
-        if (!navigator.geolocation) {
-            setError('Location is not supported by this browser. Allow location access or use a device with GPS.');
-            return;
-        }
-        setGettingLocation(true);
-        setError('');
-        navigator.geolocation.getCurrentPosition(
-            position => {
-                setDeliveryLocation({ latitude: position.coords.latitude, longitude: position.coords.longitude });
-                setGettingLocation(false);
-            },
-            locationError => {
-                setGettingLocation(false);
-                setError(locationError.code === locationError.PERMISSION_DENIED
-                    ? 'Allow location access to calculate your delivery fee.'
-                    : 'Could not get your location. Please try again.');
-            },
-            { enableHighAccuracy: true, timeout: 10000, maximumAge: 60000 }
-        );
     };
     const updateCartQuantity = (line, change) => {
         const key = `${line.menuItemId}:${line.variantName}`;
@@ -600,12 +571,7 @@ export default function Customer({ theme, setTheme, onBack }) {
                 body: JSON.stringify({
                     paymentMethod,
                     businessId: orderBusinessId,
-                    fulfillment,
-                    ...(fulfillment === 'delivery' ? {
-                        deliveryAddress,
-                        deliveryLatitude: deliveryLocation?.latitude,
-                        deliveryLongitude: deliveryLocation?.longitude
-                    } : {}),
+                    fulfillment: 'pickup',
                     items: cart.map(item => ({
                         menuItemId: item.menuItemId,
                         variantName: item.variantName,
@@ -619,9 +585,7 @@ export default function Customer({ theme, setTheme, onBack }) {
             if (paymentMethod === 'razorpay') {
                 await payForOrder(result.order);
             } else {
-                setToast(fulfillment === 'delivery'
-                    ? 'Order sent to restaurant. Pay cash when it arrives.'
-                    : 'Order sent to restaurant. Pay cash when you pick it up.');
+                setToast('Order sent to restaurant. Pay cash when you pick it up.');
             }
         } catch (requestError) {
             setError(requestError.message);
@@ -629,13 +593,9 @@ export default function Customer({ theme, setTheme, onBack }) {
             setPlacingOrder(false);
         }
     };
-    const next = rewards[0]?.pts ?? REWARDS[0].pts;
-    const pct = Math.min(100, (points / next) * 100);
+    const next = rewards[0]?.pts ?? 0;
+    const pct = next ? Math.min(100, (points / next) * 100) : 0;
     const cartTotalPaise = cart.reduce((total, item) => total + item.unitPricePaise * item.quantity, 0);
-    const deliveryFeePaise = fulfillment === 'delivery'
-        ? estimateDeliveryFee(orderingBusiness, deliveryLocation)
-        : 0;
-    const checkoutTotalPaise = cartTotalPaise + deliveryFeePaise;
     const filteredMenuItems = menuItems.filter(item => {
         const matchesSearch = `${item.name} ${item.description} ${item.category}`
             .toLocaleLowerCase().includes(menuSearch.trim().toLocaleLowerCase());
@@ -740,12 +700,14 @@ export default function Customer({ theme, setTheme, onBack }) {
             <div className="star">★</div>
             <h2 className="big c">You're in!</h2>
             <p className="muted c">{authMode === 'signup'
-                ? `Welcome to ${businessName} rewards. We’ve added ${referredById ? '30 points' : '10 points'} to get you started.`
+                ? `Welcome to ${businessName} rewards. Points are added after the owner approves your visit.`
                 : `Welcome back to ${businessName} rewards.`}</p>
             <div className="card w100">
-              <div className="row"><span className="muted">Your points</span><b className="pts">{points} <small>/ {next}</small></b></div>
+              <div className="row"><span className="muted">Your points</span><b className="pts">{points}{rewards[0] && <small> / {next}</small>}</b></div>
               <Bar pct={pct}/>
-              <p>{Math.max(0, next - points)} more points to your first reward: <b>{rewards[0]?.name ?? REWARDS[0].name}</b></p>
+              <p>{rewards[0]
+                ? <>{Math.max(0, next - points)} more points to your first reward: <b>{rewards[0].name}</b></>
+                : `${businessName} hasn’t set up any rewards yet. Check back soon.`}</p>
             </div>
           </div>
           <button className="btn" onClick={() => setScreen('home')}>See my rewards</button>
@@ -795,7 +757,7 @@ export default function Customer({ theme, setTheme, onBack }) {
                     {businesses.filter(item => item.hasMenu).map(item => <button className="marketplace-restaurant-card" key={item.id}
                       onClick={() => openRestaurant(item)}>
                       <span className="marketplace-restaurant-image" aria-hidden="true">🍽</span>
-                      <span><b>{item.name}</b><small>{item.deliveryEnabled ? 'Pickup · Delivery available' : 'Pickup only'}</small></span>
+                      <span><b>{item.name}</b><small>Pickup only</small></span>
                       <span className="marketplace-restaurant-action">View menu <span aria-hidden="true">→</span></span>
                     </button>)}
                     {!businesses.some(item => item.hasMenu) && <p className="muted small">Restaurant menus will appear here when available.</p>}
@@ -805,10 +767,12 @@ export default function Customer({ theme, setTheme, onBack }) {
                   <div className="customer-points-label"><span>✦</span> YOUR REWARDS</div>
                   <p className="customer-points-caption">You have</p>
                   <div className="customer-points-value">{points}<small>points</small></div>
-                  <div className="customer-points-progress-copy"><span>{Math.max(0, next - points)} points to your next treat</span><b>{Math.round(pct)}%</b></div>
+                  <div className="customer-points-progress-copy"><span>{rewards[0]
+                    ? `${Math.max(0, next - points)} points to ${rewards[0].name}`
+                    : 'Points are added after the owner approves your visit'}</span>{rewards[0] && <b>{Math.round(pct)}%</b>}</div>
                   <Bar pct={pct} dark/>
-                  <div className="customer-next-reward"><span aria-hidden="true">{rewards[0]?.icon ?? REWARDS[0].icon}</span>
-                    <div><small>NEXT REWARD</small><b>{rewards[0]?.name ?? REWARDS[0].name}</b></div>
+                  <div className="customer-next-reward"><span aria-hidden="true">{rewards[0]?.icon ?? '🎁'}</span>
+                    <div><small>{rewards[0] ? 'NEXT REWARD' : 'REWARDS'}</small><b>{rewards[0]?.name ?? 'Coming soon'}</b></div>
                     <button onClick={() => setScreen('rewards')} aria-label="See all rewards">→</button>
                   </div>
                 </section>
@@ -871,8 +835,7 @@ export default function Customer({ theme, setTheme, onBack }) {
               <div><span className="eyebrow">MENU</span>
                 <h3>{orderingBusiness.name}</h3>
                 <p className="small muted">
-                  {menuItems.length} {menuItems.length === 1 ? 'dish' : 'dishes'} · Pickup
-                  {orderingBusiness.deliveryEnabled ? ' · Delivery available' : ''}
+                  {menuItems.length} {menuItems.length === 1 ? 'dish' : 'dishes'} · Pickup only
                 </p>
               </div>
             </section>}
@@ -940,7 +903,7 @@ export default function Customer({ theme, setTheme, onBack }) {
               && <div className="customer-menu-empty"><span>🍽</span><h3>Menu coming soon</h3>
                 <p>{orderingBusiness?.name ?? businessName} hasn’t added any dishes yet. Check back soon.</p></div>}
             {cart.length > 0 && <section className="card customer-cart">
-              <div className="row"><div><h3>Your cart</h3><p className="small muted">{fulfillment === 'delivery' ? `Delivery from ${orderingBusiness?.name ?? businessName}` : `Pickup from ${orderingBusiness?.name ?? businessName}`}</p></div>
+              <div className="row"><div><h3>Your cart</h3><p className="small muted">Pickup from {orderingBusiness?.name ?? businessName}</p></div>
                 <button className="link" onClick={() => setCart([])}>Clear</button></div>
               {cart.map(item => <div className="customer-cart-line" key={`${item.menuItemId}:${item.variantName}`}>
                 <div className="grow"><b>{item.name}{item.variantName ? ` · ${item.variantName}` : ''}</b>
@@ -953,38 +916,16 @@ export default function Customer({ theme, setTheme, onBack }) {
                 <strong>{formatPrice(item.unitPricePaise * item.quantity)}</strong>
               </div>)}
               <fieldset className="customer-payment-method">
-                <legend>How would you like your order?</legend>
-                <label><input type="radio" name="fulfillment" checked={fulfillment === 'pickup'}
-                  onChange={() => { setFulfillment('pickup'); setPaymentMethod('cash_on_pickup'); }}/> Pickup</label>
-                <label className={orderingBusiness?.deliveryEnabled ? '' : 'disabled'}>
-                  <input type="radio" name="fulfillment" checked={fulfillment === 'delivery'}
-                    disabled={!orderingBusiness?.deliveryEnabled}
-                    onChange={() => { setFulfillment('delivery'); setPaymentMethod('cash_on_delivery'); }}/> Delivery
-                </label>
-                {!orderingBusiness?.deliveryEnabled && <small className="muted">This restaurant has not set up delivery yet.</small>}
+                <legend>Order type</legend>
+                <label><input type="radio" name="fulfillment" value="pickup" checked readOnly/> Pickup</label>
               </fieldset>
-              {fulfillment === 'delivery' && <section className="delivery-address-form">
-                <label htmlFor="delivery-address">Delivery address</label>
-                <textarea id="delivery-address" maxLength={500} required value={deliveryAddress}
-                  onChange={event => setDeliveryAddress(event.target.value)} placeholder="Flat, building, street, area and landmark"/>
-                <button className="btn ghost sm" type="button" disabled={gettingLocation} onClick={captureDeliveryLocation}>
-                  {gettingLocation ? 'Getting location…' : deliveryLocation ? 'Location captured ✓' : 'Use my current location'}
-                </button>
-                <p className="small muted">
-                  {deliveryLocation
-                    ? `Distance-based fee: ${deliveryFeePaise ? formatPrice(deliveryFeePaise) : 'Free'} (straight-line estimate).`
-                    : 'Allow location access to estimate your delivery fee. Free within 5 km; beyond that ₹20 base + ₹10 per extra km.'}
-                </p>
-              </section>}
               <div className="row customer-cart-total"><b>Food total</b><b>{formatPrice(cartTotalPaise)}</b></div>
-              {fulfillment === 'delivery' && <div className="row customer-cart-total"><span>Delivery fee</span>
-                <b>{deliveryLocation ? formatPrice(deliveryFeePaise) : 'Calculated with location'}</b></div>}
-              <div className="row customer-cart-total"><b>Order total</b><b>{formatPrice(checkoutTotalPaise)}</b></div>
+              <div className="row customer-cart-total"><b>Order total</b><b>{formatPrice(cartTotalPaise)}</b></div>
               <fieldset className="customer-payment-method">
                 <legend>Payment method</legend>
-                <label><input type="radio" name="payment-method" value={fulfillment === 'delivery' ? 'cash_on_delivery' : 'cash_on_pickup'}
-                  checked={paymentMethod !== 'razorpay'} onChange={() => setPaymentMethod(fulfillment === 'delivery' ? 'cash_on_delivery' : 'cash_on_pickup')}/>
-                  {fulfillment === 'delivery' ? 'Cash on delivery' : 'Cash on pickup'}</label>
+                <label><input type="radio" name="payment-method" value="cash_on_pickup"
+                  checked={paymentMethod !== 'razorpay'} onChange={() => setPaymentMethod('cash_on_pickup')}/>
+                  Cash on pickup</label>
                 <label className={!paymentConfig.razorpayEnabled ? 'disabled' : ''}>
                   <input type="radio" name="payment-method" value="razorpay"
                     checked={paymentMethod === 'razorpay'} disabled={!paymentConfig.razorpayEnabled}
@@ -993,10 +934,9 @@ export default function Customer({ theme, setTheme, onBack }) {
                 </label>
                 {!paymentConfig.razorpayEnabled && <small className="muted">Online payment is not set up yet. Cash on pickup is available.</small>}
               </fieldset>
-              <p className="small muted">{paymentMethod === 'razorpay' ? 'Your order reaches the restaurant after payment is verified.' : fulfillment === 'delivery' ? 'Pay cash when your order arrives.' : 'Pay cash when you pick up your order.'}</p>
-              <button className="btn" disabled={placingOrder || (fulfillment === 'delivery'
-                && (!deliveryLocation || deliveryAddress.trim().length < 8))} onClick={placeOrder}>
-                {placingOrder ? 'Placing order…' : `Place ${fulfillment} order · ${formatPrice(checkoutTotalPaise)}`}
+              <p className="small muted">{paymentMethod === 'razorpay' ? 'Your order reaches the restaurant after payment is verified.' : 'Pay cash when you pick up your order.'}</p>
+              <button className="btn" disabled={placingOrder} onClick={placeOrder}>
+                {placingOrder ? 'Placing order…' : `Place pickup order · ${formatPrice(cartTotalPaise)}`}
               </button>
             </section>}
           </div>
@@ -1063,7 +1003,7 @@ export default function Customer({ theme, setTheme, onBack }) {
             <div className="profile-invite-copy">
               <span className="eyebrow">GOOD THINGS ARE BETTER SHARED</span>
               <h3>Bring a friend along</h3>
-              <p>You both get 20 bonus points when they join. {referrals} friend{referrals === 1 ? '' : 's'} joined so far.</p>
+              <p>Invite friends to join {businessName}. Points are awarded after the owner approves your visit. {referrals} friend{referrals === 1 ? '' : 's'} joined so far.</p>
             </div>
             <button className="btn profile-invite-button" onClick={shareInvite}>Share invite link <span>↗</span></button>
           </section>
@@ -1163,20 +1103,6 @@ function groupMenuItems(items) {
 }
 function formatPrice(pricePaise) {
     return new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(pricePaise / 100);
-}
-function estimateDeliveryFee(business, location) {
-    if (!business || !location || business.latitude === null || business.longitude === null) return 0;
-    const radians = degrees => degrees * Math.PI / 180;
-    const latitudeDelta = radians(location.latitude - business.latitude);
-    const longitudeDelta = radians(location.longitude - business.longitude);
-    const a = Math.sin(latitudeDelta / 2) ** 2
-        + Math.cos(radians(business.latitude)) * Math.cos(radians(location.latitude))
-        * Math.sin(longitudeDelta / 2) ** 2;
-    const boundedA = Math.min(1, Math.max(0, a));
-    const distance = 6371 * 2 * Math.atan2(Math.sqrt(boundedA), Math.sqrt(1 - boundedA));
-    if (distance <= 5) return 0;
-    return (business.deliveryBaseFeePaise ?? 2000)
-        + Math.ceil((distance - 5) * (business.deliveryPerKmPaise ?? 1000));
 }
 function formatOrderTime(createdAt) {
     return new Date(`${createdAt.replace(' ', 'T')}Z`).toLocaleString();

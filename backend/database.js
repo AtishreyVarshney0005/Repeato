@@ -132,14 +132,7 @@ export function createDatabase(filename = resolve(serverDirectory, '..', 'databa
     const business = db.prepare('SELECT id FROM businesses ORDER BY id LIMIT 1').get();
     if (!business) {
         const seed = db.transaction(() => {
-            const result = db.prepare('INSERT INTO businesses (name) VALUES (?)').run('ElaraEatery');
-            const businessId = Number(result.lastInsertRowid);
-            const addReward = db.prepare(
-                'INSERT INTO rewards (business_id, name, points_required, icon, active) VALUES (?, ?, ?, ?, ?)'
-            );
-            addReward.run(businessId, 'Free coffee', 100, '☕', 1);
-            addReward.run(businessId, '10% off your bill', 150, '%', 1);
-            addReward.run(businessId, 'Free meal', 250, '🍴', 0);
+            db.prepare('INSERT INTO businesses (name) VALUES (?)').run('ElaraEatery');
         });
         seed();
     }

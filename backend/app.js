@@ -5,7 +5,6 @@ import jwt from 'jsonwebtoken';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const COOKIE_NAME = 'repeato_session';
-const CUSTOMER_BONUS = 10;
 const PASSWORD_HASH_ROUNDS = 10;
 
 function publicUser(user) {
@@ -270,36 +269,18 @@ export function createApp(db, options = {}) {
             }
             const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_ROUNDS);
             const createCustomer = db.transaction(() => {
-                const referralBonus = referral ? 20 : 0;
                 const result = db.prepare(`
-                    INSERT INTO users (
-                        business_id, name, email, password_hash, role, points, referral_code, referred_by_id
-                    ) VALUES (?, ?, ?, ?, 'customer', ?, ?, ?)
+                    INSERT INTO users (business_id, name, email, password_hash, role, referral_code, referred_by_id)
+                    VALUES (?, ?, ?, ?, 'customer', ?, ?)
                 `).run(
                     business.id,
                     name.trim(),
                     email.trim().toLowerCase(),
                     passwordHash,
-                    CUSTOMER_BONUS + referralBonus,
                     randomBytes(8).toString('hex'),
                     referral?.id ?? null
                 );
                 const userId = Number(result.lastInsertRowid);
-                db.prepare(`
-                    INSERT INTO point_transactions (business_id, user_id, type, points_delta, description)
-                    VALUES (?, ?, 'bonus', ?, 'Welcome bonus')
-                `).run(business.id, userId, CUSTOMER_BONUS);
-                if (referral) {
-                    db.prepare('UPDATE users SET points = points + 20 WHERE id = ?').run(referral.id);
-                    db.prepare(`
-                        INSERT INTO point_transactions (business_id, user_id, type, points_delta, description)
-                        VALUES (?, ?, 'bonus', 20, 'Friend referral bonus')
-                    `).run(business.id, userId);
-                    db.prepare(`
-                        INSERT INTO point_transactions (business_id, user_id, type, points_delta, description)
-                        VALUES (?, ?, 'bonus', 20, 'Friend referral bonus')
-                    `).run(business.id, referral.id);
-                }
                 return userId;
             });
             const userId = createCustomer();
@@ -335,12 +316,6 @@ export function createApp(db, options = {}) {
                     INSERT INTO users (business_id, name, email, password_hash, role)
                     VALUES (?, ?, ?, ?, 'owner')
                 `).run(businessId, name.trim(), email.trim().toLowerCase(), passwordHash);
-                const insertReward = db.prepare(`
-                    INSERT INTO rewards (business_id, name, points_required, icon, active)
-                    VALUES (?, ?, ?, ?, 1)
-                `);
-                insertReward.run(businessId, 'Free coffee', 100, '☕');
-                insertReward.run(businessId, '10% off your bill', 150, '%');
                 return Number(userResult.lastInsertRowid);
             });
             const user = findUser.get(createOwner());

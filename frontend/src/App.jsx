@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import Customer from './Customer';
 import Owner from './Owner';
-import DeliveryPartner from './DeliveryPartner';
 import Logo from './Logo';
 import Footer from './Footer';
 import { REWARDS } from './data';
@@ -72,11 +71,6 @@ export default function App() {
               <button className="portal-option" onClick={() => setPage('owner-login')}>
                 <span className="portal-option-icon owner-icon">↗</span>
                 <span className="portal-option-copy"><b>I'm a restaurant owner</b><small>Manage your restaurant's loyalty programme</small></span>
-                <span className="portal-arrow">→</span>
-              </button>
-              <button className="portal-option" onClick={() => setPage('partner')}>
-                <span className="portal-option-icon owner-icon">🛵</span>
-                <span className="portal-option-copy"><b>I'm a delivery partner</b><small>Sign in to manage assigned deliveries</small></span>
                 <span className="portal-arrow">→</span>
               </button>
             </div>

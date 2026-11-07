@@ -66,9 +66,9 @@ test('customers can create an email account for a selected restaurant without a 
     const dashboard = await customer('/api/customer/dashboard');
     assert.equal(dashboard.status, 200);
     const data = await dashboard.json();
-    assert.equal(data.points, 10);
-    assert.equal(data.transactions[0].title, 'Welcome bonus');
-    assert.equal(data.rewards.length, 2);
+    assert.equal(data.points, 0);
+    assert.equal(data.transactions.length, 0);
+    assert.equal(data.rewards.length, 0);
 
     const signedOut = await customer('/api/auth/logout', { method: 'POST' });
     assert.equal(signedOut.status, 204);
@@ -81,7 +81,7 @@ test('customers can create an email account for a selected restaurant without a 
     assert.equal(login.status, 200);
 });
 
-test('referral links award 20 points to both customers after a referred signup', async () => {
+test('referral links do not award points automatically', async () => {
     const businessId = db.prepare('SELECT id FROM businesses ORDER BY id LIMIT 1').get().id;
     const referrer = client();
     const referrerRegistration = await referrer('/api/auth/register', {
@@ -134,19 +134,18 @@ test('referral links award 20 points to both customers after a referred signup',
         })
     });
     assert.equal(referredRegistration.status, 201);
-    assert.equal((await referredRegistration.json()).user.points, 30);
+    assert.equal((await referredRegistration.json()).user.points, 0);
 
     const referrerDashboard = await referrer('/api/customer/dashboard');
     const referrerDataDashboard = await referrerDashboard.json();
-    assert.equal(referrerDataDashboard.points, 30);
+    assert.equal(referrerDataDashboard.points, 0);
     assert.equal(referrerDataDashboard.referrals, 1);
-    assert.equal(referrerDataDashboard.transactions[0].title, 'Friend referral bonus');
+    assert.equal(referrerDataDashboard.transactions.length, 0);
     const referredDashboard = await referred('/api/customer/dashboard');
     const referredData = await referredDashboard.json();
-    assert.equal(referredData.points, 30);
+    assert.equal(referredData.points, 0);
     assert.equal(referredData.user.referredById, referrerData.user.id);
-    assert.equal(referredData.transactions[0].title, 'Friend referral bonus');
-    assert.equal(referredData.transactions[1].title, 'Welcome bonus');
+    assert.equal(referredData.transactions.length, 0);
 });
 
 test('successful sign-in upgrades existing password hashes to the current work factor', async () => {
@@ -776,6 +775,22 @@ test('database migration preserves existing pickup orders while enabling Razorpa
 });
 
 test('redemption rejects insufficient points without changing the balance', async () => {
+    const owner = client();
+    const ownerRegistration = await owner('/api/auth/register-owner', {
+        method: 'POST',
+        body: JSON.stringify({
+            name: 'Reward Owner',
+            businessName: 'Reward Cafe',
+            email: 'reward-owner@example.com',
+            password: 'secure-pass-123'
+        })
+    });
+    const { user } = await ownerRegistration.json();
+    const rewardResponse = await owner('/api/owner/rewards', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Free meal', pts: 50 })
+    });
+    const reward = (await rewardResponse.json()).reward;
     const customer = client();
     await customer('/api/auth/register', {
         method: 'POST',
@@ -783,14 +798,12 @@ test('redemption rejects insufficient points without changing the balance', asyn
             name: 'Low Balance',
             email: 'low@example.com',
             password: 'secure-pass-123',
-            businessId: defaultBusinessId
+            businessId: user.businessId
         })
     });
-    const dashboard = await customer('/api/customer/dashboard');
-    const rewardId = (await dashboard.json()).rewards[0].id;
-    const response = await customer(`/api/customer/rewards/${rewardId}/redeem`, { method: 'POST' });
+    const response = await customer(`/api/customer/rewards/${reward.id}/redeem`, { method: 'POST' });
     assert.equal(response.status, 400);
-    assert.equal(db.prepare("SELECT points FROM users WHERE email = 'low@example.com'").get().points, 10);
+    assert.equal(db.prepare("SELECT points FROM users WHERE email = 'low@example.com'").get().points, 0);
 });
 
 test('customers request visits and only their business owner can approve points', async () => {
@@ -816,6 +829,14 @@ test('customers request visits and only their business owner can approve points'
         })
     });
     assert.equal(customerRegistration.status, 201);
+    assert.equal((await customerRegistration.json()).user.points, 0);
+    const rewardResponse = await owner('/api/owner/rewards', {
+        method: 'POST',
+        body: JSON.stringify({ name: 'Free meal', pts: 25 })
+    });
+    assert.equal(rewardResponse.status, 201);
+    const reward = (await rewardResponse.json()).reward;
+    assert.equal(reward.name, 'Free meal');
 
     const mismatch = await customer('/api/customer/check-ins', {
         method: 'POST',
@@ -858,9 +879,13 @@ test('customers request visits and only their business owner can approve points'
     assert.equal((await approved.json()).points, 25);
     const dashboard = await customer('/api/customer/dashboard');
     const data = await dashboard.json();
-    assert.equal(data.points, 35);
+    assert.equal(data.points, 25);
     assert.equal(data.visits, 1);
     assert.equal(data.transactions[0].type, 'earn');
+    assert.equal(data.rewards[0].name, 'Free meal');
+    const redemption = await customer(`/api/customer/rewards/${reward.id}/redeem`, { method: 'POST' });
+    assert.equal(redemption.status, 200);
+    assert.equal((await redemption.json()).points, 0);
     const duplicateApproval = await owner(`/api/owner/check-ins/${pendingCheckIn.id}/approve`, { method: 'POST' });
     assert.equal(duplicateApproval.status, 404);
 });
