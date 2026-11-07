@@ -41,6 +41,10 @@ For local configuration, copy `.env.example` to `.env` in this project root and 
 
 Razorpay Checkout uses Test Mode only when test credentials are configured. The backend test suite mocks Razorpay order creation, payment capture, signature verification, and refunds; complete a real sandbox checkout with your Test Mode account before switching to live credentials.
 
+## Deploy on Vercel
+
+The root `vercel.json` builds the frontend and exposes the Express API as a Vercel Function. Set the Vercel project's **Root Directory** to the repository root. The API uses a SQLite file under `/tmp`; on Vercel this is temporary, instance-local storage. **Accounts, sessions, points, rewards, and orders can disappear or differ between function instances. This deployment is for demos only, not production data.** Use a persistent database before relying on it.
+
 Passwords are hashed with bcrypt; successful sign-ins upgrade older hashes to the current work factor.
 
 ## Available features
