@@ -7,7 +7,7 @@ import { createHmac } from 'node:crypto';
 import Database from 'better-sqlite3';
 import bcrypt from 'bcrypt';
 import { createApp } from './app.js';
-import { createDatabase } from './database.js';
+import { createDatabase, createTursoDatabase } from './database.js';
 
 const db = createDatabase(':memory:');
 const defaultBusinessId = db.prepare('SELECT id FROM businesses ORDER BY id LIMIT 1').get().id;
@@ -1005,4 +1005,50 @@ test('database startup adds new feature columns to an existing database', () => 
     } finally {
         rmSync(directory, { recursive: true, force: true });
     }
+});
+
+test('Turso-compatible database initializes schema and handles async requests', async t => {
+    const remoteDb = await createTursoDatabase({ url: 'file::memory:', authToken: 'test-token' });
+    const remoteServer = createApp(remoteDb, { jwtSecret: 'test-secret' }).listen(0);
+    t.after(async () => {
+        await new Promise((resolve, reject) => remoteServer.close(error => error ? reject(error) : resolve()));
+        remoteDb.close();
+    });
+    await new Promise(resolve => remoteServer.once('listening', resolve));
+    const baseUrl = `http://127.0.0.1:${remoteServer.address().port}`;
+
+    const businesses = await fetch(`${baseUrl}/api/businesses`);
+    assert.equal(businesses.status, 200);
+    assert.equal((await businesses.json()).businesses[0].name, 'ElaraEatery');
+
+    const registration = await fetch(`${baseUrl}/api/auth/register-owner`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            name: 'Cloud Owner',
+            email: 'cloud-owner@example.test',
+            password: 'secure-pass-123',
+            businessName: 'Cloud Cafe'
+        })
+    });
+    assert.equal(registration.status, 201);
+
+    const customer = {
+        name: 'Cloud Customer',
+        email: 'cloud-customer@example.test',
+        password: 'secure-pass-123',
+        businessId: 1
+    };
+    const firstCustomer = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(customer)
+    });
+    assert.equal(firstCustomer.status, 201);
+    const duplicateCustomer = await fetch(`${baseUrl}/api/auth/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(customer)
+    });
+    assert.equal(duplicateCustomer.status, 409);
 });

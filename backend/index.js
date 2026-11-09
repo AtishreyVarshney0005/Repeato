@@ -3,7 +3,7 @@ import express from 'express';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.js';
-import { createDatabase } from './database.js';
+import { createDatabase, createTursoDatabase } from './database.js';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 dotenv.config({ path: resolve(projectRoot, '.env') });
@@ -20,7 +20,9 @@ const databasePath = process.env.DATABASE_PATH === ':memory:'
     : process.env.DATABASE_PATH
         ? resolve(projectRoot, process.env.DATABASE_PATH)
         : undefined;
-const db = createDatabase(databasePath);
+const db = process.env.TURSO_DATABASE_URL || process.env.TURSO_AUTH_TOKEN
+    ? await createTursoDatabase()
+    : createDatabase(databasePath);
 const app = createApp(db);
 const frontendBuildPath = resolve(projectRoot, 'frontend', 'dist');
 app.use(express.static(frontendBuildPath, { index: false }));

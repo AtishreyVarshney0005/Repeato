@@ -2,10 +2,15 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const COOKIE_NAME = 'repeato_session';
 const PASSWORD_HASH_ROUNDS = 10;
+
+function isUniqueConstraint(error) {
+    return error.code === 'SQLITE_CONSTRAINT_UNIQUE' || error.extendedCode === 'SQLITE_CONSTRAINT_UNIQUE';
+}
 
 function publicUser(user) {
     return {
@@ -73,15 +78,15 @@ function validMenuImage(imageData) {
     return bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP';
 }
 
-function orderItemsView(db, orderId) {
-    return db.prepare(`
+async function orderItemsView(db, orderId) {
+    return await db.prepare(`
         SELECT item_name AS name, variant_name AS variantName, quantity,
             unit_price_paise AS unitPricePaise
         FROM order_items WHERE order_id = ? ORDER BY id
     `).all(orderId);
 }
 
-function orderView(db, order) {
+async function orderView(db, order) {
     return {
         id: order.id,
         status: order.status,
@@ -99,8 +104,106 @@ function orderView(db, order) {
             customerName: order.customer_name,
             customerEmail: order.customer_email
         }),
-        items: orderItemsView(db, order.id)
+        items: await orderItemsView(db, order.id)
     };
+}
+
+function createDatabaseAdapter(connection) {
+    const remote = connection.isTurso === true;
+    const transactionContext = new AsyncLocalStorage();
+    let localQueue = Promise.resolve();
+
+    async function withLocalLock(callback) {
+        const previous = localQueue;
+        let release;
+        localQueue = new Promise(resolve => {
+            release = resolve;
+        });
+        await previous;
+        try {
+            return callback();
+        } finally {
+            release();
+        }
+    }
+
+    function toRow(result, row) {
+        return Object.fromEntries(result.columns.map((column, index) => {
+            const value = row[index];
+            return [column, typeof value === 'bigint' ? Number(value) : value];
+        }));
+    }
+
+    function prepare(sql) {
+        if (!remote) {
+            const statement = connection.prepare(sql);
+            return Object.fromEntries(['get', 'all', 'run'].map(method => [
+                method,
+                (...args) => transactionContext.getStore() === 'local'
+                    ? statement[method](...args)
+                    : withLocalLock(() => statement[method](...args))
+            ]));
+        }
+
+        const execute = async (...args) => {
+            const client = transactionContext.getStore() || connection;
+            return client.execute({ sql, args });
+        };
+        return {
+            async get(...args) {
+                const result = await execute(...args);
+                return result.rows[0] ? toRow(result, result.rows[0]) : undefined;
+            },
+            async all(...args) {
+                const result = await execute(...args);
+                return result.rows.map(row => toRow(result, row));
+            },
+            async run(...args) {
+                const result = await execute(...args);
+                return {
+                    changes: result.rowsAffected,
+                    lastInsertRowid: result.lastInsertRowid === undefined
+                        ? 0
+                        : Number(result.lastInsertRowid)
+                };
+            }
+        };
+    }
+
+    return {
+        prepare,
+        transaction(callback) {
+            return async () => {
+                if (remote) {
+                    const transaction = await connection.transaction('write');
+                    try {
+                        const result = await transactionContext.run(transaction, callback);
+                        await transaction.commit();
+                        return result;
+                    } catch (error) {
+                        await transaction.rollback();
+                        throw error;
+                    }
+                }
+
+                return withLocalLock(async () => {
+                    connection.exec('BEGIN');
+                    try {
+                        const result = await transactionContext.run('local', callback);
+                        connection.exec('COMMIT');
+                        return result;
+                    } catch (error) {
+                        connection.exec('ROLLBACK');
+                        throw error;
+                    }
+                });
+            };
+        }
+    };
+}
+
+function asyncRoute(handler) {
+    return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 }
 
 function distanceKm(firstLatitude, firstLongitude, secondLatitude, secondLongitude) {
@@ -116,6 +219,11 @@ function distanceKm(firstLatitude, firstLongitude, secondLatitude, secondLongitu
 
 export function createApp(db, options = {}) {
     const app = express();
+    db = createDatabaseAdapter(db);
+    for (const method of ['get', 'post', 'patch', 'delete']) {
+        const register = app[method].bind(app);
+        app[method] = (path, ...handlers) => register(path, ...handlers.map(asyncRoute));
+    }
     const secret = options.jwtSecret || process.env.JWT_SECRET || 'local-development-secret-change-before-deploy';
     const razorpayKeyId = options.razorpayKeyId ?? process.env.RAZORPAY_KEY_ID ?? '';
     const razorpayKeySecret = options.razorpayKeySecret ?? process.env.RAZORPAY_KEY_SECRET ?? '';
@@ -152,24 +260,25 @@ export function createApp(db, options = {}) {
         WHERE delivery_partners.id = ? AND delivery_partners.active = 1
     `);
 
-    function requireAuth(req, res, next) {
+    async function requireAuth(req, res, next) {
         const token = req.cookies?.[COOKIE_NAME];
         if (!token) return res.status(401).json({ error: 'Please sign in to continue.' });
+        let payload;
         try {
-            const payload = jwt.verify(token, secret);
-            const user = payload.role === 'delivery_partner'
-                ? findPartner.get(payload.sub)
-                : findUser.get(payload.sub);
-            if (!user || user.role !== payload.role) {
-                res.clearCookie(COOKIE_NAME, clearCookieOptions);
-                return res.status(401).json({ error: 'Your session is no longer valid. Please sign in again.' });
-            }
-            req.user = user;
-            return next();
+            payload = jwt.verify(token, secret);
         } catch {
             res.clearCookie(COOKIE_NAME, clearCookieOptions);
             return res.status(401).json({ error: 'Your session has expired. Please sign in again.' });
         }
+        const user = payload.role === 'delivery_partner'
+            ? await findPartner.get(payload.sub)
+            : await findUser.get(payload.sub);
+        if (!user || user.role !== payload.role) {
+            res.clearCookie(COOKIE_NAME, clearCookieOptions);
+            return res.status(401).json({ error: 'Your session is no longer valid. Please sign in again.' });
+        }
+        req.user = user;
+        return next();
     }
 
     function requireRole(role) {
@@ -186,7 +295,7 @@ export function createApp(db, options = {}) {
 
     app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 
-    app.get('/api/businesses', (req, res) => {
+    app.get('/api/businesses', async (req, res) => {
         if (req.query.search !== undefined) {
             if (typeof req.query.search !== 'string' || req.query.search.trim().length > 100) {
                 return res.status(400).json({ error: 'Enter a restaurant search of up to 100 characters.' });
@@ -194,7 +303,7 @@ export function createApp(db, options = {}) {
             const search = req.query.search.trim();
             if (!search) return res.json({ businesses: [] });
             const term = `%${search.replace(/[\\%_]/g, '\\$&')}%`;
-            const businesses = db.prepare(`
+            const businesses = await db.prepare(`
                 SELECT businesses.id, businesses.name
                 FROM businesses
                 WHERE businesses.name LIKE ? ESCAPE '\\'
@@ -207,24 +316,24 @@ export function createApp(db, options = {}) {
             `).all(term);
             return res.json({ businesses });
         }
-        const businesses = db.prepare(`
+        const businesses = (await db.prepare(`
             SELECT businesses.id, businesses.name,
                 EXISTS (SELECT 1 FROM menu_items WHERE menu_items.business_id = businesses.id AND available = 1) AS has_menu,
                 (businesses.latitude IS NOT NULL AND businesses.longitude IS NOT NULL) AS delivery_enabled
             FROM businesses ORDER BY businesses.name COLLATE NOCASE, businesses.id
-        `).all().map(item => ({
+        `).all()).map(item => ({
             id: item.id, name: item.name, hasMenu: Boolean(item.has_menu),
             deliveryEnabled: Boolean(item.delivery_enabled)
         }));
         return res.json({ businesses });
     });
 
-    app.get('/api/businesses/:id/menu', (req, res) => {
+    app.get('/api/businesses/:id/menu', async (req, res) => {
         const businessId = Number(req.params.id);
         if (!Number.isSafeInteger(businessId) || businessId <= 0) {
             return res.status(400).json({ error: 'Choose a valid restaurant.' });
         }
-        const business = db.prepare(`
+        const business = await db.prepare(`
             SELECT id, name, menu_url AS menuUrl, latitude, longitude,
                 delivery_base_fee_paise AS deliveryBaseFeePaise,
                 delivery_per_km_paise AS deliveryPerKmPaise
@@ -232,13 +341,13 @@ export function createApp(db, options = {}) {
                 AND EXISTS (SELECT 1 FROM users WHERE users.business_id = businesses.id AND users.role = 'owner')
         `).get(businessId);
         if (!business) return res.status(404).json({ error: 'Restaurant not found.' });
-        const menuItems = db.prepare(`
+        const menuItems = (await db.prepare(`
             SELECT id, name, description, category, price_paise AS pricePaise,
                 image_data AS imageData, dietary_type AS dietaryType, spice_level AS spiceLevel,
                 allergens, variants_json AS variantsJson
             FROM menu_items WHERE business_id = ? AND available = 1
             ORDER BY category COLLATE NOCASE, name COLLATE NOCASE
-        `).all(businessId).map(menuItemView);
+        `).all(businessId)).map(menuItemView);
         return res.json({
             business: { ...business, deliveryEnabled: business.latitude !== null && business.longitude !== null },
             menuItems
@@ -255,11 +364,11 @@ export function createApp(db, options = {}) {
                 return res.status(400).json({ error: 'Invalid referral link.' });
             }
             const business = Number.isSafeInteger(businessId) && businessId > 0
-                ? db.prepare('SELECT id FROM businesses WHERE id = ?').get(businessId)
+                ? await db.prepare('SELECT id FROM businesses WHERE id = ?').get(businessId)
                 : null;
             if (!business) return res.status(400).json({ error: 'Choose a valid business to join.' });
             const referral = referralCode?.trim()
-                ? db.prepare(`
+                ? await db.prepare(`
                     SELECT id FROM users
                     WHERE referral_code = ? COLLATE NOCASE AND business_id = ? AND role = 'customer'
                 `).get(referralCode.trim(), business.id)
@@ -268,8 +377,8 @@ export function createApp(db, options = {}) {
                 return res.status(400).json({ error: 'This referral link is invalid or belongs to another business.' });
             }
             const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_ROUNDS);
-            const createCustomer = db.transaction(() => {
-                const result = db.prepare(`
+            const createCustomer = db.transaction(async () => {
+                const result = await db.prepare(`
                     INSERT INTO users (business_id, name, email, password_hash, role, referral_code, referred_by_id)
                     VALUES (?, ?, ?, ?, 'customer', ?, ?)
                 `).run(
@@ -283,12 +392,12 @@ export function createApp(db, options = {}) {
                 const userId = Number(result.lastInsertRowid);
                 return userId;
             });
-            const userId = createCustomer();
-            const user = findUser.get(userId);
+            const userId = await createCustomer();
+            const user = await findUser.get(userId);
             setSession(res, user);
             return res.status(201).json({ user: publicUser(user) });
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+            if (isUniqueConstraint(error)) {
                 return res.status(409).json({ error: 'An account with this email already exists.' });
             }
             return next(error);
@@ -304,25 +413,25 @@ export function createApp(db, options = {}) {
                 return res.status(400).json({ error: 'Enter your name, business name, valid email, and a password of 8 to 128 characters.' });
             }
             const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_ROUNDS);
-            const createOwner = db.transaction(() => {
-                if (db.prepare("SELECT id FROM users WHERE email = ? COLLATE NOCASE AND role = 'owner'").get(email.trim())) {
+            const createOwner = db.transaction(async () => {
+                if (await db.prepare("SELECT id FROM users WHERE email = ? COLLATE NOCASE AND role = 'owner'").get(email.trim())) {
                     const error = new Error('An owner account with this email already exists.');
                     error.code = 'SQLITE_CONSTRAINT_UNIQUE';
                     throw error;
                 }
-                const businessResult = db.prepare('INSERT INTO businesses (name) VALUES (?)').run(businessName.trim());
+                const businessResult = await db.prepare('INSERT INTO businesses (name) VALUES (?)').run(businessName.trim());
                 const businessId = Number(businessResult.lastInsertRowid);
-                const userResult = db.prepare(`
+                const userResult = await db.prepare(`
                     INSERT INTO users (business_id, name, email, password_hash, role)
                     VALUES (?, ?, ?, ?, 'owner')
                 `).run(businessId, name.trim(), email.trim().toLowerCase(), passwordHash);
                 return Number(userResult.lastInsertRowid);
             });
-            const user = findUser.get(createOwner());
+            const user = await findUser.get(await createOwner());
             setSession(res, user);
             return res.status(201).json({ user: publicUser(user) });
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+            if (isUniqueConstraint(error)) {
                 return res.status(409).json({ error: 'An account with this email already exists for this business.' });
             }
             return next(error);
@@ -336,12 +445,12 @@ export function createApp(db, options = {}) {
                 return res.status(400).json({ error: 'Enter a valid email and password.' });
             }
             const user = role === 'delivery_partner'
-                ? db.prepare(`
+                ? await db.prepare(`
                     SELECT delivery_partners.*, businesses.name AS business_name, 'delivery_partner' AS role
                     FROM delivery_partners JOIN businesses ON businesses.id = delivery_partners.business_id
                     WHERE delivery_partners.email = ? COLLATE NOCASE AND delivery_partners.active = 1
                 `).get(email.trim())
-                : db.prepare(`
+                : await db.prepare(`
                     SELECT users.*, businesses.name AS business_name
                     FROM users JOIN businesses ON businesses.id = users.business_id
                     WHERE users.email = ? COLLATE NOCASE AND users.role = ?
@@ -352,7 +461,7 @@ export function createApp(db, options = {}) {
             }
             if (bcrypt.getRounds(user.password_hash) !== PASSWORD_HASH_ROUNDS) {
                 const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_ROUNDS);
-                db.prepare(role === 'delivery_partner'
+                await db.prepare(role === 'delivery_partner'
                     ? 'UPDATE delivery_partners SET password_hash = ? WHERE id = ?'
                     : 'UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, user.id);
             }
@@ -379,49 +488,49 @@ export function createApp(db, options = {}) {
                 return res.status(400).json({ error: 'Enter your name, a valid email, password, and invitation link.' });
             }
             const tokenHash = createHmac('sha256', secret).update(inviteToken).digest('hex');
-            const invite = db.prepare(`
+            const invite = await db.prepare(`
                 SELECT * FROM delivery_partner_invites
                 WHERE token_hash = ? AND email = ? COLLATE NOCASE
                     AND used_at IS NULL AND expires_at > datetime('now')
             `).get(tokenHash, email.trim());
             if (!invite) return res.status(400).json({ error: 'This delivery partner invitation is invalid or expired.' });
             const passwordHash = await bcrypt.hash(password, PASSWORD_HASH_ROUNDS);
-            const register = db.transaction(() => {
-                const currentInvite = db.prepare(`
+            const register = db.transaction(async () => {
+                const currentInvite = await db.prepare(`
                     UPDATE delivery_partner_invites SET used_at = datetime('now')
                     WHERE id = ? AND used_at IS NULL AND expires_at > datetime('now')
                 `).run(invite.id);
                 if (!currentInvite.changes) return null;
-                const result = db.prepare(`
+                const result = await db.prepare(`
                     INSERT INTO delivery_partners (business_id, name, email, password_hash)
                     VALUES (?, ?, ?, ?)
                 `).run(invite.business_id, name.trim(), email.trim(), passwordHash);
-                return findPartner.get(Number(result.lastInsertRowid));
+                return await findPartner.get(Number(result.lastInsertRowid));
             });
-            const partner = register();
+            const partner = await register();
             if (!partner) return res.status(409).json({ error: 'This invitation has already been used.' });
             setSession(res, partner);
             return res.status(201).json({ user: publicUser(partner) });
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+            if (isUniqueConstraint(error)) {
                 return res.status(409).json({ error: 'An account with this email already exists.' });
             }
             return next(error);
         }
     });
 
-    app.patch('/api/customer/profile', requireAuth, requireRole('customer'), (req, res) => {
+    app.patch('/api/customer/profile', requireAuth, requireRole('customer'), async (req, res) => {
         const { name, birthday, notificationsEnabled } = req.body ?? {};
         if (typeof name !== 'string' || !name.trim() || name.trim().length > 100
             || !validBirthday(birthday)
             || typeof notificationsEnabled !== 'boolean') {
             return res.status(400).json({ error: 'Enter a valid name, birthday, and notification setting.' });
         }
-        db.prepare(`
+        await db.prepare(`
             UPDATE users SET name = ?, birthday = ?, notifications_enabled = ?
             WHERE id = ? AND role = 'customer'
         `).run(name.trim(), birthday || null, notificationsEnabled ? 1 : 0, req.user.id);
-        return res.json({ user: publicUser(findUser.get(req.user.id)) });
+        return res.json({ user: publicUser(await findUser.get(req.user.id)) });
     });
 
     app.delete('/api/customer/account', requireAuth, requireRole('customer'), async (req, res, next) => {
@@ -430,7 +539,7 @@ export function createApp(db, options = {}) {
             if (typeof password !== 'string' || !(await bcrypt.compare(password, req.user.password_hash))) {
                 return res.status(401).json({ error: 'Password is incorrect.' });
             }
-            db.prepare('DELETE FROM users WHERE id = ? AND role = ?').run(req.user.id, 'customer');
+            await db.prepare('DELETE FROM users WHERE id = ? AND role = ?').run(req.user.id, 'customer');
             res.clearCookie(COOKIE_NAME, clearCookieOptions);
             return res.status(204).end();
         } catch (error) {
@@ -438,67 +547,67 @@ export function createApp(db, options = {}) {
         }
     });
 
-    app.post('/api/customer/check-ins', requireAuth, requireRole('customer'), (req, res, next) => {
+    app.post('/api/customer/check-ins', requireAuth, requireRole('customer'), async (req, res, next) => {
         const { businessId } = req.body ?? {};
         if (!Number.isSafeInteger(businessId) || businessId !== req.user.business_id) {
             return res.status(400).json({ error: 'This visit QR code is not for your rewards business.' });
         }
         try {
-            const result = db.prepare(`
+            const result = await db.prepare(`
                 INSERT INTO visit_checkins (business_id, user_id, status)
                 VALUES (?, ?, 'pending')
             `).run(businessId, req.user.id);
             return res.status(201).json({ checkInId: Number(result.lastInsertRowid), status: 'pending' });
         } catch (error) {
-            if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+            if (isUniqueConstraint(error)) {
                 return res.status(409).json({ error: 'Your visit is already waiting for owner approval.' });
             }
             return next(error);
         }
     });
 
-    app.get('/api/customer/dashboard', requireAuth, requireRole('customer'), (req, res) => {
-        const business = db.prepare(`SELECT id, points_per_visit, menu_url, latitude, longitude,
+    app.get('/api/customer/dashboard', requireAuth, requireRole('customer'), async (req, res) => {
+        const business = await db.prepare(`SELECT id, points_per_visit, menu_url, latitude, longitude,
             delivery_base_fee_paise, delivery_per_km_paise FROM businesses WHERE id = ?`)
             .get(req.user.business_id);
-        const rewards = db.prepare(`
+        const rewards = (await db.prepare(`
             SELECT rewards.*, COUNT(point_transactions.id) AS claimed
             FROM rewards LEFT JOIN point_transactions
                 ON point_transactions.reward_id = rewards.id AND point_transactions.type = 'redeem'
             WHERE rewards.business_id = ? AND rewards.active = 1
             GROUP BY rewards.id ORDER BY rewards.points_required
-        `).all(req.user.business_id).map(rewardView);
-        const transactions = db.prepare(`
+        `).all(req.user.business_id)).map(rewardView);
+        const transactions = (await db.prepare(`
             SELECT description AS title, type, points_delta AS points, created_at
             FROM point_transactions WHERE user_id = ? ORDER BY id DESC LIMIT 20
-        `).all(req.user.id).map(item => ({
+        `).all(req.user.id)).map(item => ({
             title: item.title,
             type: item.type,
             pts: Math.abs(item.points),
             when: new Date(`${item.created_at.replace(' ', 'T')}Z`).toLocaleDateString()
         }));
-        const visits = db.prepare(`
+        const visits = (await db.prepare(`
             SELECT COUNT(*) AS total FROM visit_checkins
             WHERE user_id = ? AND status = 'approved'
-        `).get(req.user.id).total;
-        const pendingCheckIn = db.prepare(`
+        `).get(req.user.id)).total;
+        const pendingCheckIn = await db.prepare(`
             SELECT id FROM visit_checkins WHERE user_id = ? AND status = 'pending'
         `).get(req.user.id);
-        const claimed = db.prepare(`
+        const claimed = (await db.prepare(`
             SELECT COUNT(*) AS total FROM point_transactions WHERE user_id = ? AND type = 'redeem'
-        `).get(req.user.id).total;
-        const referrals = db.prepare(`
+        `).get(req.user.id)).total;
+        const referrals = (await db.prepare(`
             SELECT COUNT(*) AS total FROM users WHERE referred_by_id = ? AND role = 'customer'
-        `).get(req.user.id).total;
-        const menuItems = db.prepare(`
+        `).get(req.user.id)).total;
+        const menuItems = (await db.prepare(`
             SELECT id, name, description, category, price_paise AS pricePaise,
                 image_data AS imageData, dietary_type AS dietaryType, spice_level AS spiceLevel,
                 allergens, variants_json AS variantsJson
             FROM menu_items
             WHERE business_id = ? AND available = 1
             ORDER BY category COLLATE NOCASE, name COLLATE NOCASE
-        `).all(req.user.business_id).map(menuItemView);
-        const orders = db.prepare(`
+        `).all(req.user.business_id)).map(menuItemView);
+        const orders = await Promise.all((await db.prepare(`
             SELECT orders.id, orders.status, orders.payment_method, orders.payment_status,
                 orders.fulfillment, orders.total_paise, orders.delivery_address,
                 orders.delivery_distance_km, orders.delivery_fee_paise, orders.created_at,
@@ -506,7 +615,7 @@ export function createApp(db, options = {}) {
             FROM orders JOIN businesses ON businesses.id = orders.business_id
             LEFT JOIN delivery_partners ON delivery_partners.id = orders.delivery_partner_id
             WHERE customer_id = ? ORDER BY orders.id DESC LIMIT 50
-        `).all(req.user.id).map(order => orderView(db, order));
+        `).all(req.user.id)).map(async order => await orderView(db, order)));
         return res.json({
             user: publicUser(req.user),
             business: {
@@ -529,8 +638,8 @@ export function createApp(db, options = {}) {
         });
     });
 
-    app.get('/api/customer/orders', requireAuth, requireRole('customer'), (req, res) => {
-        const orders = db.prepare(`
+    app.get('/api/customer/orders', requireAuth, requireRole('customer'), async (req, res) => {
+        const orders = await Promise.all((await db.prepare(`
             SELECT orders.id, orders.status, orders.payment_method, orders.payment_status,
                 orders.fulfillment, orders.total_paise, orders.delivery_address,
                 orders.delivery_distance_km, orders.delivery_fee_paise, orders.created_at,
@@ -538,7 +647,7 @@ export function createApp(db, options = {}) {
             FROM orders JOIN businesses ON businesses.id = orders.business_id
             LEFT JOIN delivery_partners ON delivery_partners.id = orders.delivery_partner_id
             WHERE orders.customer_id = ? ORDER BY orders.id DESC LIMIT 50
-        `).all(req.user.id).map(order => orderView(db, order));
+        `).all(req.user.id)).map(async order => await orderView(db, order)));
         return res.json({ orders });
     });
 
@@ -546,7 +655,7 @@ export function createApp(db, options = {}) {
         return res.json({ enabled: razorpayEnabled, keyId: razorpayEnabled ? razorpayKeyId : '' });
     });
 
-    app.post('/api/customer/orders', requireAuth, requireRole('customer'), (req, res) => {
+    app.post('/api/customer/orders', requireAuth, requireRole('customer'), async (req, res) => {
         const {
             items, businessId = req.user.business_id, fulfillment = 'pickup',
             paymentMethod = fulfillment === 'delivery' ? 'cash_on_delivery' : 'cash_on_pickup',
@@ -582,9 +691,9 @@ export function createApp(db, options = {}) {
         }
 
         try {
-            const orderId = db.transaction(() => {
-                const orderLines = items.map(line => {
-                    const menuItem = db.prepare(`
+            const orderId = await db.transaction(async () => {
+                const orderLines = await Promise.all(items.map(async line => {
+                    const menuItem = await db.prepare(`
                         SELECT id, name, price_paise, variants_json
                         FROM menu_items
                         WHERE id = ? AND business_id = ? AND available = 1
@@ -612,9 +721,9 @@ export function createApp(db, options = {}) {
                         throw error;
                     }
                     return { ...line, name: menuItem.name, variantName, unitPricePaise };
-                });
+                }));
                 const itemTotalPaise = orderLines.reduce((total, item) => total + item.unitPricePaise * item.quantity, 0);
-                const businessRow = db.prepare(`
+                const businessRow = await db.prepare(`
                     SELECT latitude, longitude, delivery_base_fee_paise, delivery_per_km_paise
                     FROM businesses WHERE id = ?
                         AND EXISTS (SELECT 1 FROM users WHERE users.business_id = businesses.id AND users.role = 'owner')
@@ -646,7 +755,7 @@ export function createApp(db, options = {}) {
                     error.status = 400;
                     throw error;
                 }
-                const result = db.prepare(`
+                const result = await db.prepare(`
                     INSERT INTO orders (
                         business_id, customer_id, total_paise, payment_method, payment_status,
                         fulfillment, delivery_address, delivery_latitude, delivery_longitude,
@@ -665,11 +774,11 @@ export function createApp(db, options = {}) {
                     VALUES (?, ?, ?, ?, ?, ?)
                 `);
                 for (const item of orderLines) {
-                    addItem.run(result.lastInsertRowid, item.menuItemId, item.name, item.variantName, item.quantity, item.unitPricePaise);
+                    await addItem.run(result.lastInsertRowid, item.menuItemId, item.name, item.variantName, item.quantity, item.unitPricePaise);
                 }
                 return Number(result.lastInsertRowid);
             })();
-            const order = db.prepare(`
+            const order = await db.prepare(`
                 SELECT orders.id, orders.status, orders.payment_method, orders.payment_status,
                     orders.fulfillment, orders.total_paise, orders.delivery_address,
                     orders.delivery_distance_km, orders.delivery_fee_paise, orders.created_at,
@@ -677,7 +786,7 @@ export function createApp(db, options = {}) {
                 FROM orders JOIN businesses ON businesses.id = orders.business_id
                 WHERE orders.id = ? AND orders.customer_id = ?
             `).get(orderId, req.user.id);
-            return res.status(201).json({ order: orderView(db, order) });
+            return res.status(201).json({ order: await orderView(db, order) });
         } catch (error) {
             if (error.status) return res.status(error.status).json({ error: error.message });
             throw error;
@@ -688,7 +797,7 @@ export function createApp(db, options = {}) {
         const orderId = Number(req.params.id);
         if (!Number.isSafeInteger(orderId) || orderId <= 0) return res.status(400).json({ error: 'Choose a valid order.' });
         if (!razorpayEnabled) return res.status(503).json({ error: 'Razorpay online payment is not configured.' });
-        const order = db.prepare(`
+        const order = await db.prepare(`
             SELECT id, status, payment_method, payment_status, total_paise, razorpay_order_id
             FROM orders WHERE id = ? AND customer_id = ?
         `).get(orderId, req.user.id);
@@ -726,12 +835,12 @@ export function createApp(db, options = {}) {
                 || typeof providerOrder.id !== 'string' || !providerOrder.id.startsWith('order_')) {
                 return res.status(502).json({ error: 'Razorpay could not prepare this payment. Please retry or choose cash on pickup.' });
             }
-            const saved = db.prepare(`
+            const saved = await db.prepare(`
                 UPDATE orders SET razorpay_order_id = ?, updated_at = datetime('now')
                 WHERE id = ? AND customer_id = ? AND payment_status = 'pending' AND razorpay_order_id IS NULL
             `).run(providerOrder.id, orderId, req.user.id);
             if (!saved.changes) {
-                const current = db.prepare('SELECT razorpay_order_id FROM orders WHERE id = ? AND customer_id = ?')
+                const current = await db.prepare('SELECT razorpay_order_id FROM orders WHERE id = ? AND customer_id = ?')
                     .get(orderId, req.user.id);
                 if (!current?.razorpay_order_id) return res.status(409).json({ error: 'This order changed. Refresh and retry payment.' });
                 return res.json({
@@ -764,7 +873,7 @@ export function createApp(db, options = {}) {
             return res.status(400).json({ error: 'Razorpay returned invalid payment details.' });
         }
         if (!razorpayEnabled) return res.status(503).json({ error: 'Razorpay online payment is not configured.' });
-        const order = db.prepare(`
+        const order = await db.prepare(`
             SELECT id, status, payment_method, payment_status, total_paise, razorpay_order_id
             FROM orders WHERE id = ? AND customer_id = ?
         `).get(orderId, req.user.id);
@@ -781,7 +890,7 @@ export function createApp(db, options = {}) {
             return res.status(400).json({ error: 'Payment verification failed. Please contact support if money was deducted.' });
         }
         if (order.payment_status === 'paid') {
-            return res.json({ order: orderView(db, db.prepare(`
+            return res.json({ order: await orderView(db, await db.prepare(`
                 SELECT id, status, payment_method, payment_status, fulfillment, total_paise, created_at
                 FROM orders WHERE id = ? AND customer_id = ?
             `).get(orderId, req.user.id)) });
@@ -811,26 +920,26 @@ export function createApp(db, options = {}) {
                 || payment.amount !== order.total_paise || payment.currency !== 'INR') {
                 return res.status(409).json({ error: 'Payment is not captured yet. Please retry verification shortly.' });
             }
-            db.prepare(`
+            await db.prepare(`
                 UPDATE orders SET payment_status = 'paid', razorpay_payment_id = ?, updated_at = datetime('now')
                 WHERE id = ? AND customer_id = ? AND payment_status = 'pending'
             `).run(paymentId, orderId, req.user.id);
-            const verifiedOrder = db.prepare(`
+            const verifiedOrder = await db.prepare(`
                 SELECT id, status, payment_method, payment_status, fulfillment, total_paise, created_at
                 FROM orders WHERE id = ? AND customer_id = ?
             `).get(orderId, req.user.id);
-            return res.json({ order: orderView(db, verifiedOrder) });
+            return res.json({ order: await orderView(db, verifiedOrder) });
         } catch (error) {
             return next(error);
         }
     });
 
-    app.post('/api/customer/rewards/:id/redeem', requireAuth, requireRole('customer'), (req, res, next) => {
+    app.post('/api/customer/rewards/:id/redeem', requireAuth, requireRole('customer'), async (req, res, next) => {
         const rewardId = Number(req.params.id);
         if (!Number.isSafeInteger(rewardId) || rewardId <= 0) return res.status(400).json({ error: 'Invalid reward.' });
         try {
-            const redeem = db.transaction(() => {
-                const reward = db.prepare(`
+            const redeem = db.transaction(async () => {
+                const reward = await db.prepare(`
                     SELECT * FROM rewards WHERE id = ? AND business_id = ? AND active = 1
                 `).get(rewardId, req.user.business_id);
                 if (!reward) {
@@ -838,21 +947,21 @@ export function createApp(db, options = {}) {
                     error.status = 404;
                     throw error;
                 }
-                const user = db.prepare('SELECT points FROM users WHERE id = ?').get(req.user.id);
+                const user = await db.prepare('SELECT points FROM users WHERE id = ?').get(req.user.id);
                 if (user.points < reward.points_required) {
                     const error = new Error('You do not have enough points for this reward.');
                     error.status = 400;
                     throw error;
                 }
-                db.prepare('UPDATE users SET points = points - ? WHERE id = ?')
+                await db.prepare('UPDATE users SET points = points - ? WHERE id = ?')
                     .run(reward.points_required, req.user.id);
-                db.prepare(`
+                await db.prepare(`
                     INSERT INTO point_transactions (business_id, user_id, reward_id, type, points_delta, description)
                     VALUES (?, ?, ?, 'redeem', ?, ?)
                 `).run(req.user.business_id, req.user.id, reward.id, -reward.points_required, reward.name);
             });
-            redeem();
-            const updatedUser = findUser.get(req.user.id);
+            await redeem();
+            const updatedUser = await findUser.get(req.user.id);
             return res.json({ points: updatedUser.points });
         } catch (error) {
             if (error.status) return res.status(error.status).json({ error: error.message });
@@ -860,9 +969,9 @@ export function createApp(db, options = {}) {
         }
     });
 
-    app.get('/api/owner/dashboard', requireAuth, requireRole('owner'), (req, res) => {
+    app.get('/api/owner/dashboard', requireAuth, requireRole('owner'), async (req, res) => {
         const businessId = req.user.business_id;
-        const totals = db.prepare(`
+        const totals = await db.prepare(`
             SELECT
                 COUNT(DISTINCT users.id) AS customers,
                 COALESCE(SUM(CASE WHEN points_delta > 0 AND point_transactions.created_at >= datetime('now', '-7 days') THEN points_delta ELSE 0 END), 0) AS points_issued,
@@ -871,7 +980,7 @@ export function createApp(db, options = {}) {
                 ON point_transactions.user_id = users.id AND point_transactions.business_id = users.business_id
             WHERE users.business_id = ? AND users.role = 'customer'
         `).get(businessId);
-        const customers = db.prepare(`
+        const customers = await db.prepare(`
             SELECT users.name, users.email, users.points, COUNT(visit_checkins.id) AS visits
             FROM users LEFT JOIN visit_checkins
                 ON visit_checkins.user_id = users.id
@@ -881,7 +990,7 @@ export function createApp(db, options = {}) {
             GROUP BY users.id
             ORDER BY visits DESC, users.points DESC, users.created_at DESC LIMIT 5
         `).all(businessId);
-        const signups = db.prepare(`
+        const signups = await db.prepare(`
             SELECT CAST(strftime('%w', created_at) AS INTEGER) AS weekday, COUNT(*) AS total
             FROM users WHERE business_id = ? AND role = 'customer'
                 AND created_at >= datetime('now', '-6 days')
@@ -898,7 +1007,7 @@ export function createApp(db, options = {}) {
                 total: signupTotals.get(weekday) || 0
             };
         });
-        const visits = db.prepare(`
+        const visits = await db.prepare(`
             SELECT CAST(strftime('%w', approved_at) AS INTEGER) AS weekday, COUNT(*) AS total
             FROM visit_checkins
             WHERE business_id = ? AND status = 'approved'
@@ -915,27 +1024,27 @@ export function createApp(db, options = {}) {
                 total: visitTotals.get(weekday) || 0
             };
         });
-        const redemptions = db.prepare(`
+        const redemptions = (await db.prepare(`
             SELECT point_transactions.description AS name, users.email, point_transactions.created_at
             FROM point_transactions JOIN users ON users.id = point_transactions.user_id
             WHERE point_transactions.business_id = ? AND point_transactions.type = 'redeem'
             ORDER BY point_transactions.id DESC LIMIT 5
-        `).all(businessId).map(item => ({
+        `).all(businessId)).map(item => ({
             name: item.name,
             email: item.email,
             when: new Date(`${item.created_at.replace(' ', 'T')}Z`).toLocaleDateString()
         }));
-        const claims = db.prepare(`
+        const claims = (await db.prepare(`
             SELECT COUNT(*) AS total FROM point_transactions
             WHERE business_id = ? AND type = 'redeem' AND created_at >= datetime('now', '-7 days')
-        `).get(businessId).total;
-        const repeatVisits = db.prepare(`
+        `).get(businessId)).total;
+        const repeatVisits = (await db.prepare(`
             SELECT COUNT(*) AS total FROM (
                 SELECT user_id FROM visit_checkins
                 WHERE business_id = ? AND status = 'approved'
                 GROUP BY user_id HAVING COUNT(*) > 1
             )
-        `).get(businessId).total;
+        `).get(businessId)).total;
         const repeatVisitRate = totals.customers
             ? Math.round((repeatVisits / totals.customers) * 100)
             : 0;
@@ -956,8 +1065,8 @@ export function createApp(db, options = {}) {
         });
     });
 
-    app.get('/api/owner/customers', requireAuth, requireRole('owner'), (req, res) => {
-        const customers = db.prepare(`
+    app.get('/api/owner/customers', requireAuth, requireRole('owner'), async (req, res) => {
+        const customers = await db.prepare(`
             SELECT users.id, users.name, users.email, users.points, users.created_at,
                 COUNT(DISTINCT visit_checkins.id) AS visits,
                 COUNT(DISTINCT CASE WHEN point_transactions.type = 'redeem' THEN point_transactions.id END) AS rewards_claimed,
@@ -973,8 +1082,8 @@ export function createApp(db, options = {}) {
         return res.json({ customers });
     });
 
-    app.get('/api/owner/check-ins', requireAuth, requireRole('owner'), (req, res) => {
-        const checkIns = db.prepare(`
+    app.get('/api/owner/check-ins', requireAuth, requireRole('owner'), async (req, res) => {
+        const checkIns = await db.prepare(`
             SELECT visit_checkins.id, visit_checkins.requested_at, users.name, users.email
             FROM visit_checkins JOIN users ON users.id = visit_checkins.user_id
             WHERE visit_checkins.business_id = ? AND visit_checkins.status = 'pending'
@@ -983,37 +1092,37 @@ export function createApp(db, options = {}) {
         return res.json({ checkIns });
     });
 
-    app.post('/api/owner/check-ins/:id/approve', requireAuth, requireRole('owner'), (req, res) => {
+    app.post('/api/owner/check-ins/:id/approve', requireAuth, requireRole('owner'), async (req, res) => {
         const checkInId = Number(req.params.id);
         if (!Number.isSafeInteger(checkInId) || checkInId <= 0) {
             return res.status(400).json({ error: 'Invalid visit request.' });
         }
-        const approve = db.transaction(() => {
-            const checkIn = db.prepare(`
+        const approve = db.transaction(async () => {
+            const checkIn = await db.prepare(`
                 SELECT id, user_id FROM visit_checkins
                 WHERE id = ? AND business_id = ? AND status = 'pending'
             `).get(checkInId, req.user.business_id);
             if (!checkIn) return null;
-            const points = db.prepare('SELECT points_per_visit FROM businesses WHERE id = ?')
-                .get(req.user.business_id).points_per_visit;
-            db.prepare(`
+            const points = (await db.prepare('SELECT points_per_visit FROM businesses WHERE id = ?')
+                .get(req.user.business_id)).points_per_visit;
+            await db.prepare(`
                 UPDATE visit_checkins SET status = 'approved', points_awarded = ?, approved_at = datetime('now')
                 WHERE id = ? AND status = 'pending'
             `).run(points, checkInId);
-            db.prepare('UPDATE users SET points = points + ? WHERE id = ?').run(points, checkIn.user_id);
-            db.prepare(`
+            await db.prepare('UPDATE users SET points = points + ? WHERE id = ?').run(points, checkIn.user_id);
+            await db.prepare(`
                 INSERT INTO point_transactions (business_id, user_id, type, points_delta, description)
                 VALUES (?, ?, 'earn', ?, 'Verified visit')
             `).run(req.user.business_id, checkIn.user_id, points);
             return { points };
         });
-        const result = approve();
+        const result = await approve();
         if (!result) return res.status(404).json({ error: 'Visit request not found or already approved.' });
         return res.json(result);
     });
 
-    app.get('/api/owner/settings', requireAuth, requireRole('owner'), (req, res) => {
-        const business = db.prepare(`
+    app.get('/api/owner/settings', requireAuth, requireRole('owner'), async (req, res) => {
+        const business = await db.prepare(`
             SELECT id, name, points_per_visit AS pointsPerVisit, menu_url AS menuUrl,
                 latitude, longitude, delivery_base_fee_paise AS deliveryBaseFeePaise,
                 delivery_per_km_paise AS deliveryPerKmPaise
@@ -1022,9 +1131,9 @@ export function createApp(db, options = {}) {
         return res.json({ business });
     });
 
-    app.patch('/api/owner/settings', requireAuth, requireRole('owner'), (req, res) => {
+    app.patch('/api/owner/settings', requireAuth, requireRole('owner'), async (req, res) => {
         const { name, pointsPerVisit, menuUrl } = req.body ?? {};
-        const currentBusiness = db.prepare('SELECT latitude, longitude FROM businesses WHERE id = ?')
+        const currentBusiness = await db.prepare('SELECT latitude, longitude FROM businesses WHERE id = ?')
             .get(req.user.business_id);
         const latitude = Object.hasOwn(req.body ?? {}, 'latitude') ? req.body.latitude : currentBusiness.latitude;
         const longitude = Object.hasOwn(req.body ?? {}, 'longitude') ? req.body.longitude : currentBusiness.longitude;
@@ -1050,13 +1159,13 @@ export function createApp(db, options = {}) {
             || typeof longitude !== 'number' || !Number.isFinite(longitude) || longitude < -180 || longitude > 180)) {
             return res.status(400).json({ error: 'Enter valid restaurant map coordinates, or leave both blank to disable delivery.' });
         }
-        db.prepare(`
+        await db.prepare(`
             UPDATE businesses SET name = ?, points_per_visit = ?, menu_url = ?, latitude = ?, longitude = ?
             WHERE id = ?
         `).run(name.trim(), pointsPerVisit, validMenuUrl,
             locationIsEmpty ? null : latitude, locationIsEmpty ? null : longitude, req.user.business_id);
         return res.json({
-            business: db.prepare(`
+            business: await db.prepare(`
                 SELECT id, name, points_per_visit AS pointsPerVisit, menu_url AS menuUrl,
                     latitude, longitude, delivery_base_fee_paise AS deliveryBaseFeePaise,
                     delivery_per_km_paise AS deliveryPerKmPaise
@@ -1065,19 +1174,19 @@ export function createApp(db, options = {}) {
         });
     });
 
-    app.get('/api/owner/menu', requireAuth, requireRole('owner'), (req, res) => {
-        const menuItems = db.prepare(`
+    app.get('/api/owner/menu', requireAuth, requireRole('owner'), async (req, res) => {
+        const menuItems = (await db.prepare(`
             SELECT id, name, description, category, price_paise AS pricePaise, available,
                 image_data AS imageData, dietary_type AS dietaryType, spice_level AS spiceLevel,
                 allergens, variants_json AS variantsJson
             FROM menu_items WHERE business_id = ?
             ORDER BY category COLLATE NOCASE, name COLLATE NOCASE
-        `).all(req.user.business_id).map(menuItemView);
+        `).all(req.user.business_id)).map(menuItemView);
         return res.json({ menuItems });
     });
 
-    app.get('/api/owner/orders', requireAuth, requireRole('owner'), (req, res) => {
-        const orders = db.prepare(`
+    app.get('/api/owner/orders', requireAuth, requireRole('owner'), async (req, res) => {
+        const orders = await Promise.all((await db.prepare(`
             SELECT orders.id, orders.status, orders.payment_method, orders.payment_status, orders.fulfillment,
                 orders.total_paise, orders.delivery_address, orders.delivery_distance_km,
                 orders.delivery_fee_paise, orders.created_at, users.name AS customer_name,
@@ -1089,7 +1198,7 @@ export function createApp(db, options = {}) {
             WHERE orders.business_id = ?
                 AND (orders.payment_method != 'razorpay' OR orders.payment_status = 'paid')
             ORDER BY orders.id DESC LIMIT 100
-        `).all(req.user.business_id).map(order => orderView(db, order));
+        `).all(req.user.business_id)).map(async order => await orderView(db, order)));
         return res.json({ orders });
     });
 
@@ -1100,7 +1209,7 @@ export function createApp(db, options = {}) {
             || !['accepted', 'rejected', 'preparing', 'ready'].includes(status)) {
             return res.status(400).json({ error: 'Choose a valid order status.' });
         }
-        const currentOrder = db.prepare(`
+        const currentOrder = await db.prepare(`
             SELECT id, status, payment_method, payment_status, total_paise, razorpay_payment_id
             FROM orders WHERE id = ? AND business_id = ?
         `).get(orderId, req.user.business_id);
@@ -1114,7 +1223,7 @@ export function createApp(db, options = {}) {
             if (!razorpayEnabled || !currentOrder.razorpay_payment_id) {
                 return res.status(503).json({ error: 'Razorpay refund is not available. The paid order has not been rejected.' });
             }
-            const claimedRefund = db.prepare(`
+            const claimedRefund = await db.prepare(`
                 UPDATE orders SET payment_status = 'refund_pending', updated_at = datetime('now')
                 WHERE id = ? AND business_id = ? AND status = 'pending' AND payment_status = 'paid'
             `).run(orderId, req.user.business_id);
@@ -1135,32 +1244,32 @@ export function createApp(db, options = {}) {
                 if (!refundResponse.ok || typeof refund.id !== 'string'
                     || refund.payment_id !== currentOrder.razorpay_payment_id
                     || !['processed', 'pending'].includes(refund.status)) {
-                    db.prepare(`
+                    await db.prepare(`
                         UPDATE orders SET payment_status = 'paid', updated_at = datetime('now')
                         WHERE id = ? AND business_id = ? AND status = 'pending' AND payment_status = 'refund_pending'
                     `).run(orderId, req.user.business_id);
                     return res.status(502).json({ error: 'Razorpay could not confirm the refund. The order remains open.' });
                 }
-                db.prepare(`
+                await db.prepare(`
                     UPDATE orders SET status = 'rejected', payment_status = ?, razorpay_refund_id = ?,
                         updated_at = datetime('now')
                     WHERE id = ? AND business_id = ? AND status = 'pending' AND payment_status = 'refund_pending'
                 `).run(refund.status === 'processed' ? 'refunded' : 'refund_pending', refund.id, orderId, req.user.business_id);
             } catch (error) {
-                db.prepare(`
+                await db.prepare(`
                     UPDATE orders SET payment_status = 'paid', updated_at = datetime('now')
                     WHERE id = ? AND business_id = ? AND status = 'pending' AND payment_status = 'refund_pending'
                 `).run(orderId, req.user.business_id);
                 return next(error);
             }
         } else {
-            const result = db.prepare(`
+            const result = await db.prepare(`
                 UPDATE orders SET status = ?, updated_at = datetime('now')
                 WHERE id = ? AND business_id = ? AND status = ?
             `).run(status, orderId, req.user.business_id, currentOrder.status);
             if (!result.changes) return res.status(409).json({ error: 'This order has already been processed.' });
         }
-        const order = db.prepare(`
+        const order = await db.prepare(`
             SELECT orders.id, orders.status, orders.payment_method, orders.payment_status, orders.fulfillment,
                 orders.total_paise, orders.delivery_address, orders.delivery_distance_km,
                 orders.delivery_fee_paise, orders.created_at, users.name AS customer_name,
@@ -1171,18 +1280,18 @@ export function createApp(db, options = {}) {
             LEFT JOIN delivery_partners ON delivery_partners.id = orders.delivery_partner_id
             WHERE orders.id = ? AND orders.business_id = ?
         `).get(orderId, req.user.business_id);
-        return res.json({ order: orderView(db, order) });
+        return res.json({ order: await orderView(db, order) });
     });
 
-    app.get('/api/owner/delivery-partners', requireAuth, requireRole('owner'), (req, res) => {
-        const partners = db.prepare(`
+    app.get('/api/owner/delivery-partners', requireAuth, requireRole('owner'), async (req, res) => {
+        const partners = (await db.prepare(`
             SELECT id, name, email, active FROM delivery_partners
             WHERE business_id = ? ORDER BY name COLLATE NOCASE
-        `).all(req.user.business_id).map(partner => ({ ...partner, active: Boolean(partner.active) }));
+        `).all(req.user.business_id)).map(partner => ({ ...partner, active: Boolean(partner.active) }));
         return res.json({ partners });
     });
 
-    app.post('/api/owner/delivery-partners/invites', requireAuth, requireRole('owner'), (req, res) => {
+    app.post('/api/owner/delivery-partners/invites', requireAuth, requireRole('owner'), async (req, res) => {
         const email = req.body?.email;
         if (typeof email !== 'string' || email.trim().length > 254
             || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
@@ -1190,7 +1299,7 @@ export function createApp(db, options = {}) {
         }
         const token = randomBytes(32).toString('base64url');
         const tokenHash = createHmac('sha256', secret).update(token).digest('hex');
-        db.prepare(`
+        await db.prepare(`
             INSERT INTO delivery_partner_invites (business_id, email, token_hash, expires_at)
             VALUES (?, ?, ?, datetime('now', '+7 days'))
         `).run(req.user.business_id, email.trim(), tokenHash);
@@ -1198,20 +1307,20 @@ export function createApp(db, options = {}) {
         return res.status(201).json({ inviteUrl, email: email.trim(), expiresInDays: 7 });
     });
 
-    app.patch('/api/owner/delivery-partners/:id', requireAuth, requireRole('owner'), (req, res) => {
+    app.patch('/api/owner/delivery-partners/:id', requireAuth, requireRole('owner'), async (req, res) => {
         const partnerId = Number(req.params.id);
         const { active } = req.body ?? {};
         if (!Number.isSafeInteger(partnerId) || partnerId <= 0 || typeof active !== 'boolean') {
             return res.status(400).json({ error: 'Choose a delivery partner and valid active status.' });
         }
-        if (!active && db.prepare(`
+        if (!active && await db.prepare(`
             SELECT 1 FROM orders
             WHERE delivery_partner_id = ? AND business_id = ? AND status = 'out_for_delivery'
             LIMIT 1
         `).get(partnerId, req.user.business_id)) {
             return res.status(409).json({ error: 'This partner has an active delivery. Reassign or complete it before disabling the account.' });
         }
-        const result = db.prepare(`
+        const result = await db.prepare(`
             UPDATE delivery_partners SET active = ?
             WHERE id = ? AND business_id = ?
         `).run(Number(active), partnerId, req.user.business_id);
@@ -1219,14 +1328,14 @@ export function createApp(db, options = {}) {
         return res.json({ success: true });
     });
 
-    app.patch('/api/owner/orders/:id/dispatch', requireAuth, requireRole('owner'), (req, res) => {
+    app.patch('/api/owner/orders/:id/dispatch', requireAuth, requireRole('owner'), async (req, res) => {
         const orderId = Number(req.params.id);
         const partnerId = req.body?.partnerId;
         if (!Number.isSafeInteger(orderId) || orderId <= 0
             || !Number.isSafeInteger(partnerId) || partnerId <= 0) {
             return res.status(400).json({ error: 'Choose a valid order and delivery partner.' });
         }
-        const result = db.prepare(`
+        const result = await db.prepare(`
             UPDATE orders SET delivery_partner_id = ?, status = 'out_for_delivery', updated_at = datetime('now')
             WHERE id = ? AND business_id = ? AND fulfillment = 'delivery' AND status = 'ready'
                 AND EXISTS (
@@ -1238,8 +1347,8 @@ export function createApp(db, options = {}) {
         return res.json({ success: true });
     });
 
-    app.get('/api/delivery-partner/orders', requireAuth, requireRole('delivery_partner'), (req, res) => {
-        const orders = db.prepare(`
+    app.get('/api/delivery-partner/orders', requireAuth, requireRole('delivery_partner'), async (req, res) => {
+        const orders = await Promise.all((await db.prepare(`
             SELECT orders.id, orders.status, orders.payment_method, orders.payment_status,
                 orders.fulfillment, orders.total_paise, orders.delivery_address,
                 orders.delivery_distance_km, orders.delivery_fee_paise, orders.created_at,
@@ -1250,16 +1359,16 @@ export function createApp(db, options = {}) {
             JOIN delivery_partners ON delivery_partners.id = orders.delivery_partner_id
             WHERE orders.delivery_partner_id = ? AND delivery_partners.active = 1
             ORDER BY orders.id DESC LIMIT 100
-        `).all(req.user.id).map(order => orderView(db, order));
+        `).all(req.user.id)).map(async order => await orderView(db, order)));
         return res.json({ orders });
     });
 
-    app.patch('/api/delivery-partner/orders/:id', requireAuth, requireRole('delivery_partner'), (req, res) => {
+    app.patch('/api/delivery-partner/orders/:id', requireAuth, requireRole('delivery_partner'), async (req, res) => {
         const orderId = Number(req.params.id);
         if (!Number.isSafeInteger(orderId) || orderId <= 0) {
             return res.status(400).json({ error: 'Choose a valid delivery order.' });
         }
-        const result = db.prepare(`
+        const result = await db.prepare(`
             UPDATE orders SET status = 'delivered', updated_at = datetime('now')
             WHERE id = ? AND delivery_partner_id = ? AND status = 'out_for_delivery'
                 AND EXISTS (SELECT 1 FROM delivery_partners WHERE id = ? AND active = 1)
@@ -1268,7 +1377,7 @@ export function createApp(db, options = {}) {
         return res.json({ success: true });
     });
 
-    app.post('/api/owner/menu', requireAuth, requireRole('owner'), (req, res) => {
+    app.post('/api/owner/menu', requireAuth, requireRole('owner'), async (req, res) => {
         const {
             name, description = '', category = 'Main', price,
             imageData = '', dietaryType = '', spiceLevel = '', allergens = '', variants = []
@@ -1303,7 +1412,7 @@ export function createApp(db, options = {}) {
         const pricePaise = normalizedVariants.length
             ? normalizedVariants[0].pricePaise
             : Math.round(price * 100);
-        const result = db.prepare(`
+        const result = await db.prepare(`
             INSERT INTO menu_items (
                 business_id, name, description, category, price_paise, image_data,
                 dietary_type, spice_level, allergens, variants_json
@@ -1312,7 +1421,7 @@ export function createApp(db, options = {}) {
             req.user.business_id, name.trim(), description.trim(), category.trim(), pricePaise,
             imageData, dietaryType, spiceLevel, allergens.trim(), JSON.stringify(normalizedVariants)
         );
-        const item = db.prepare(`
+        const item = await db.prepare(`
             SELECT id, name, description, category, price_paise AS pricePaise, available,
                 image_data AS imageData, dietary_type AS dietaryType, spice_level AS spiceLevel,
                 allergens, variants_json AS variantsJson
@@ -1321,18 +1430,18 @@ export function createApp(db, options = {}) {
         return res.status(201).json({ menuItem: menuItemView(item) });
     });
 
-    app.patch('/api/owner/menu/:id', requireAuth, requireRole('owner'), (req, res) => {
+    app.patch('/api/owner/menu/:id', requireAuth, requireRole('owner'), async (req, res) => {
         const itemId = Number(req.params.id);
         const { available } = req.body ?? {};
         if (!Number.isSafeInteger(itemId) || itemId <= 0 || typeof available !== 'boolean') {
             return res.status(400).json({ error: 'Choose a valid menu item and availability setting.' });
         }
-        const result = db.prepare(`
+        const result = await db.prepare(`
             UPDATE menu_items SET available = ?
             WHERE id = ? AND business_id = ?
         `).run(available ? 1 : 0, itemId, req.user.business_id);
         if (!result.changes) return res.status(404).json({ error: 'Menu item not found.' });
-        return res.json({ menuItem: menuItemView(db.prepare(`
+        return res.json({ menuItem: menuItemView(await db.prepare(`
             SELECT id, name, description, category, price_paise AS pricePaise, available,
                 image_data AS imageData, dietary_type AS dietaryType, spice_level AS spiceLevel,
                 allergens, variants_json AS variantsJson
@@ -1340,28 +1449,28 @@ export function createApp(db, options = {}) {
         `).get(itemId, req.user.business_id)) });
     });
 
-    app.delete('/api/owner/menu/:id', requireAuth, requireRole('owner'), (req, res) => {
+    app.delete('/api/owner/menu/:id', requireAuth, requireRole('owner'), async (req, res) => {
         const itemId = Number(req.params.id);
         if (!Number.isSafeInteger(itemId) || itemId <= 0) {
             return res.status(400).json({ error: 'Choose a valid menu item.' });
         }
-        const result = db.prepare('DELETE FROM menu_items WHERE id = ? AND business_id = ?')
+        const result = await db.prepare('DELETE FROM menu_items WHERE id = ? AND business_id = ?')
             .run(itemId, req.user.business_id);
         if (!result.changes) return res.status(404).json({ error: 'Menu item not found.' });
         return res.status(204).end();
     });
 
-    app.get('/api/owner/rewards', requireAuth, requireRole('owner'), (req, res) => {
-        const rewards = db.prepare(`
+    app.get('/api/owner/rewards', requireAuth, requireRole('owner'), async (req, res) => {
+        const rewards = (await db.prepare(`
             SELECT rewards.*, COUNT(point_transactions.id) AS claimed
             FROM rewards LEFT JOIN point_transactions
                 ON point_transactions.reward_id = rewards.id AND point_transactions.type = 'redeem'
             WHERE rewards.business_id = ? GROUP BY rewards.id ORDER BY rewards.id
-        `).all(req.user.business_id).map(rewardView);
+        `).all(req.user.business_id)).map(rewardView);
         return res.json({ rewards });
     });
 
-    app.post('/api/owner/rewards', requireAuth, requireRole('owner'), (req, res, next) => {
+    app.post('/api/owner/rewards', requireAuth, requireRole('owner'), async (req, res, next) => {
         const { name, pts, icon = '🎁' } = req.body ?? {};
         if (typeof name !== 'string' || !name.trim() || name.trim().length > 100
             || !Number.isSafeInteger(pts) || pts <= 0 || pts > 100000
@@ -1369,29 +1478,29 @@ export function createApp(db, options = {}) {
             return res.status(400).json({ error: 'Enter a reward name and a points value between 1 and 100000.' });
         }
         try {
-            const result = db.prepare(`
+            const result = await db.prepare(`
                 INSERT INTO rewards (business_id, name, points_required, icon, active)
                 VALUES (?, ?, ?, ?, 1)
             `).run(req.user.business_id, name.trim(), pts, icon);
-            const reward = db.prepare('SELECT * FROM rewards WHERE id = ?').get(result.lastInsertRowid);
+            const reward = await db.prepare('SELECT * FROM rewards WHERE id = ?').get(result.lastInsertRowid);
             return res.status(201).json({ reward: rewardView(reward) });
         } catch (error) {
             return next(error);
         }
     });
 
-    app.patch('/api/owner/rewards/:id', requireAuth, requireRole('owner'), (req, res) => {
+    app.patch('/api/owner/rewards/:id', requireAuth, requireRole('owner'), async (req, res) => {
         const rewardId = Number(req.params.id);
         const { on } = req.body ?? {};
         if (!Number.isSafeInteger(rewardId) || rewardId <= 0 || typeof on !== 'boolean') {
             return res.status(400).json({ error: 'Invalid reward update.' });
         }
-        const result = db.prepare(`
+        const result = await db.prepare(`
             UPDATE rewards SET active = ?
             WHERE id = ? AND business_id = ?
         `).run(on ? 1 : 0, rewardId, req.user.business_id);
         if (!result.changes) return res.status(404).json({ error: 'Reward not found.' });
-        const reward = db.prepare('SELECT * FROM rewards WHERE id = ?').get(rewardId);
+        const reward = await db.prepare('SELECT * FROM rewards WHERE id = ?').get(rewardId);
         return res.json({ reward: rewardView(reward) });
     });
 

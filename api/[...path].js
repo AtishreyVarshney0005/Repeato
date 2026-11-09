@@ -1,10 +1,11 @@
-import { randomBytes } from 'node:crypto';
 import { createApp } from '../backend/app.js';
-import { createDatabase } from '../backend/database.js';
+import { createTursoDatabase } from '../backend/database.js';
 
-const database = createDatabase(process.env.DATABASE_PATH || '/tmp/repeato.sqlite');
-const app = createApp(database, {
-    jwtSecret: process.env.JWT_SECRET || randomBytes(32).toString('hex')
-});
+if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET must be set in production.');
+}
+
+const database = await createTursoDatabase();
+const app = createApp(database, { jwtSecret: process.env.JWT_SECRET });
 
 export default app;

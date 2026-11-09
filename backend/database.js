@@ -1,10 +1,41 @@
 import Database from 'better-sqlite3';
+import { createClient } from '@libsql/client';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const serverDirectory = dirname(fileURLToPath(import.meta.url));
+
+export async function createTursoDatabase({
+    url = process.env.TURSO_DATABASE_URL,
+    authToken = process.env.TURSO_AUTH_TOKEN
+} = {}) {
+    if (!url || !authToken) {
+        throw new Error('Set both TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to use Turso.');
+    }
+
+    const db = createClient({ url, authToken });
+    await db.executeMultiple(readFileSync(new URL('../database/schema.sql', import.meta.url), 'utf8'));
+    await db.executeMultiple(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code
+            ON users(referral_code COLLATE NOCASE) WHERE referral_code IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_razorpay_order
+            ON orders(razorpay_order_id) WHERE razorpay_order_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_orders_business_created ON orders(business_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_orders_customer_created ON orders(customer_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+        CREATE INDEX IF NOT EXISTS idx_orders_partner_status
+            ON orders(delivery_partner_id, status, created_at DESC);
+    `);
+
+    const business = await db.execute('SELECT id FROM businesses ORDER BY id LIMIT 1');
+    if (business.rows.length === 0) {
+        await db.execute('INSERT INTO businesses (name) VALUES (?)', ['ElaraEatery']);
+    }
+
+    return Object.assign(db, { isTurso: true });
+}
 
 export function createDatabase(filename = resolve(serverDirectory, '..', 'database', 'data', 'repeato.sqlite')) {
     if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true });
