@@ -3,14 +3,18 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=26 <27"
+  },
   "scripts": {
     "dev": "node index.js",
     "start": "node index.js",
     "test": "node --test"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "bcrypt": "^6.0.0",
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^13.0.3",
     "cookie-parser": "^1.4.7",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
